@@ -64,3 +64,5 @@ preview = true
 pythonVersion = "3.9"
 typeCheckingMode = "strict"
 include = ["apple_symbols"]
+venvPath = "."
+venv = ".venv"
