@@ -2,5 +2,7 @@
 __pycache__
 *.pyc
 *.egg-info
-apple_symbols/_version.pybuild/
+apple_symbols/_version.py
+build/
 dist/
+.venv/
