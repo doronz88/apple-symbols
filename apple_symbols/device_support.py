@@ -11,7 +11,6 @@ import hashlib
 import json
 import logging
 import os
-import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -60,7 +59,7 @@ def _scan(root: Path) -> list[SymbolImage]:
             try:
                 with open(file, "rb") as fd:
                     macho = parse_macho(fd)
-            except (OSError, struct.error):
+            except OSError:
                 continue
             if macho is None or macho.uuid is None or macho.vmaddr is None:
                 continue
@@ -183,7 +182,7 @@ class DeviceSupportSymbols:
                 if macho is not None and macho.function_starts_size:
                     fd.seek(macho.function_starts_offset)
                     symtab.function_starts = parse_function_starts(fd.read(macho.function_starts_size), image.vmaddr)
-        except (OSError, struct.error) as e:
+        except OSError as e:
             logger.debug(f"Could not read the symbols of {image.path}: {e}")
         self._symtabs[image.path] = symtab
         return symtab

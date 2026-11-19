@@ -1,3 +1,4 @@
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from apple_symbols import (
     get_device_support_path,
     kernel,
 )
+from apple_symbols.macho import NLIST_64, MachHeader64, Nlist64, parse_macho
 from apple_symbols.testing import build_fileset, build_macho
 
 SHARED_CACHE_BASE = 0x180000000
@@ -199,3 +201,14 @@ def test_find_device_support_symbols(tmp_path: Path) -> None:
     assert find_device_support_symbols("iPhone17,3", "23E246", "26.5", root=tmp_path) is None
     assert find_device_support_symbols("iPhone17,3", "23E247", root=tmp_path) is None
     assert find_device_support_symbols("iPhone17", "23E246", root=tmp_path) is None
+
+
+def test_parse_macho_truncated_is_not_a_macho() -> None:
+    data = build_macho(LIBFOO_UUID, 0x180000000, 0x4000, {"_function": 0x10}, [0x10])
+    for size in (0, 16, MachHeader64.SIZE, MachHeader64.SIZE + 4, MachHeader64.SIZE + 40):
+        assert parse_macho(io.BytesIO(data[:size])) is None
+
+
+def test_nlist_layouts_agree() -> None:
+    entry = Nlist64(n_strx=1, n_type=0x0F, n_sect=1, n_desc=0, n_value=0x180000010)
+    assert NLIST_64.unpack(entry.build()) == (1, 0x0F, 1, 0, 0x180000010)

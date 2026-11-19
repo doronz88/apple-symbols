@@ -11,7 +11,6 @@ import hashlib
 import json
 import logging
 import os
-import struct
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,7 +64,7 @@ def _decompress(kernelcache: Path, directory: Path) -> Path:
     """Get the Mach-O of a kernelcache, which firmwares ship compressed inside an IM4P."""
     with open(kernelcache, "rb") as fd:
         magic = fd.read(4)
-    if len(magic) == 4 and struct.unpack("<I", magic)[0] == MH_MAGIC_64:
+    if len(magic) == 4 and int.from_bytes(magic, "little") == MH_MAGIC_64:
         return kernelcache
     run("ipsw", "kernel", "dec", kernelcache, "--output", directory)
     decompressed = [file for file in directory.rglob("*") if file.is_file()]
