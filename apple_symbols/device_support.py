@@ -16,18 +16,38 @@ from pathlib import Path
 from typing import Optional
 
 from apple_symbols._cache import default_cache_dir
-from apple_symbols.macho import parse_function_starts, parse_macho, read_symbol_name, read_symbols
+from apple_symbols.macho import MachO, parse_function_starts, parse_macho, read_symbol_name, read_symbols
+from apple_symbols.objc import (
+    CLASS_DATA,
+    CLASS_DATA_MASK,
+    CLASS_RO_NAME,
+    POINTER_SIZE,
+    ImageData,
+    ObjCMethod,
+    PointerDecoder,
+    find_pointer_decoder,
+    read_objc_methods,
+)
 
 logger = logging.getLogger(__name__)
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 INDEX_DIRNAME = "device_support_index"
 
 DEVICE_SUPPORT_ROOT = Path("~/Library/Developer/Xcode/iOS DeviceSupport")
 
+# The image holding the strings of the Objective-C metadata of the whole cache, and telling where
+# its selectors start
+LIBOBJC_PATH = "/usr/lib/libobjc.A.dylib"
+SELECTOR_OFFSETS_SECTION = "__objc_scoffs"
 # The tree also holds the images of the shared cache DriverKit extensions run with, which is mapped
 # over the same addresses, so only one of the caches gets to be looked up by address
 DRIVERKIT_PREFIX = "/System/DriverKit/"
+
+# Anything above it in that section is a pointer
+SELECTOR_OFFSETS_MAX_VERSION = 0xFFFF
+# Longest class or selector name read
+MAX_OBJC_NAME_LENGTH = 1024
 
 # Shared caches get mapped at a multiple of this, and their first image starts well within it
 SHARED_CACHE_BASE_ALIGNMENT = 0x2000000
@@ -55,8 +75,19 @@ class _SymbolTable:
     function_starts: list[int] = field(default_factory=list[int])
 
 
-def _scan(root: Path) -> list[SymbolImage]:
+@dataclass
+class _ObjCTable:
+    addresses: list[int] = field(default_factory=list[int])
+    methods: list[ObjCMethod] = field(default_factory=list[ObjCMethod])
+
+
+# Address and size of a segment, and the index of its image
+_Segment = tuple[int, int, int]
+
+
+def _scan(root: Path) -> tuple[list[SymbolImage], list[_Segment]]:
     images: list[SymbolImage] = []
+    segments: list[_Segment] = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for filename in filenames:
             file = Path(dirpath) / filename
@@ -67,6 +98,13 @@ def _scan(root: Path) -> list[SymbolImage]:
                 continue
             if macho is None or macho.uuid is None or macho.vmaddr is None:
                 continue
+            if macho.vmaddr:
+                # Only the images of the shared cache have addresses of their own to be found by
+                segments += [
+                    (segment.vmaddr, segment.vmsize, len(images))
+                    for segment in macho.segments
+                    if segment.filesize and segment.name != "__LINKEDIT"
+                ]
             images.append(
                 SymbolImage(
                     path="/" + file.relative_to(root).as_posix(),
@@ -75,7 +113,7 @@ def _scan(root: Path) -> list[SymbolImage]:
                     vmsize=macho.vmsize,
                 )
             )
-    return images
+    return images, segments
 
 
 def fingerprint(root: Path) -> list[int]:
@@ -95,7 +133,12 @@ def fingerprint(root: Path) -> list[int]:
 class DeviceSupportSymbols:
     """Resolves addresses to symbols using the Mach-O files below `root`."""
 
-    def __init__(self, root: Path, images: list[SymbolImage]) -> None:
+    def __init__(self, root: Path, images: list[SymbolImage], segments: Optional[list[_Segment]] = None) -> None:
+        """
+        :param segments: Address and size of the segments of the images, each with the index of its
+            image in `images`. They locate what the Objective-C metadata of an image refers to
+            outside of it, so the methods of categories and of stripped images go unnamed without.
+        """
         self.root = root
         self.images = sorted(images, key=lambda image: image.vmaddr)
         self._addressed = [image for image in self.images if not image.path.startswith(DRIVERKIT_PREFIX)]
@@ -103,6 +146,21 @@ class DeviceSupportSymbols:
         self._by_uuid = {image.uuid: image for image in self.images}
         self._symtabs: dict[str, _SymbolTable] = {}
         self._names: dict[tuple[str, int], str] = {}
+        self._segments = sorted(
+            (
+                (vmaddr, vmsize, images[index])
+                for vmaddr, vmsize, index in segments or []
+                if not images[index].path.startswith(DRIVERKIT_PREFIX)
+            ),
+            key=lambda segment: segment[0],
+        )
+        self._segment_starts = [vmaddr for vmaddr, _, _ in self._segments]
+        self._machos: dict[str, Optional[MachO]] = {}
+        self._objc: dict[str, _ObjCTable] = {}
+        self._objc_names: dict[int, Optional[str]] = {}
+        self._decode: Optional[PointerDecoder] = None
+        self._selector_base: Optional[int] = None
+        self._selector_base_read = False
 
     @classmethod
     def load(cls, root: Path, index_dir: Optional[Path] = None) -> "DeviceSupportSymbols":
@@ -125,12 +183,16 @@ class DeviceSupportSymbols:
                 and index["root"] == str(root)
                 and index["fingerprint"] == tree_fingerprint
             ):
-                return cls(root, [SymbolImage(*image) for image in index["images"]])
-        except (OSError, ValueError, KeyError, TypeError):
+                return cls(
+                    root,
+                    [SymbolImage(*image) for image in index["images"]],
+                    [(vmaddr, vmsize, image) for vmaddr, vmsize, image in index["segments"]],
+                )
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
             pass
 
         logger.info(f"Indexing symbols of {root}")
-        images = _scan(root)
+        images, segments = _scan(root)
         try:
             index_dir.mkdir(parents=True, exist_ok=True)
             index_file.write_text(
@@ -139,11 +201,12 @@ class DeviceSupportSymbols:
                     "root": str(root),
                     "fingerprint": tree_fingerprint,
                     "images": [[image.path, image.uuid, image.vmaddr, image.vmsize] for image in images],
+                    "segments": segments,
                 })
             )
         except OSError as e:
             logger.debug(f"Could not store the symbols index at {index_file}: {e}")
-        return cls(root, images)
+        return cls(root, images, segments)
 
     @property
     def has_shared_cache_images(self) -> bool:
@@ -210,13 +273,12 @@ class DeviceSupportSymbols:
         """
         symtab = self._symtab(image)
         index = bisect.bisect_right(symtab.addresses, address) - 1
-        if index < 0:
-            return None
-        symbol_address = symtab.addresses[index]
         function = bisect.bisect_right(symtab.function_starts, address) - 1
-        if function >= 0 and symtab.function_starts[function] > symbol_address:
+        function_start = symtab.function_starts[function] if function >= 0 else None
+        if index < 0 or (function_start is not None and function_start > symtab.addresses[index]):
             # The address belongs to a function the symbol table does not name
-            return None
+            return self._symbolicate_objc_method(image, address, function_start)
+        symbol_address = symtab.addresses[index]
         try:
             name = self._symbol_name(image, symtab.stroff + symtab.string_offsets[index])
         except OSError:
@@ -224,6 +286,117 @@ class DeviceSupportSymbols:
         if not name:
             return None
         return name, address - symbol_address
+
+    def _symbolicate_objc_method(
+        self, image: SymbolImage, address: int, function_start: Optional[int]
+    ) -> Optional[tuple[str, int]]:
+        """Name the function `address` is in as the Objective-C method it implements, if it is one."""
+        if function_start is None:
+            # Nothing tells whether the method preceding the address reaches it
+            return None
+        table = self._objc_table(image)
+        index = bisect.bisect_left(table.addresses, function_start)
+        if index == len(table.addresses) or table.addresses[index] != function_start:
+            return None
+        name = self._objc_method_name(table.methods[index])
+        return None if name is None else (name, address - function_start)
+
+    def _macho(self, image: SymbolImage) -> Optional[MachO]:
+        if image.path not in self._machos:
+            try:
+                with open(self.root / image.path.lstrip("/"), "rb") as fd:
+                    self._machos[image.path] = parse_macho(fd)
+            except OSError as e:
+                logger.debug(f"Could not read {image.path}: {e}")
+                self._machos[image.path] = None
+        return self._machos[image.path]
+
+    def _read(self, address: int, size: int) -> Optional[bytes]:
+        """Read what the image mapped at the given unslid address holds there, up to the end of its segment."""
+        index = bisect.bisect_right(self._segment_starts, address) - 1
+        if index < 0:
+            return None
+        vmaddr, vmsize, image = self._segments[index]
+        macho = self._macho(image) if address < vmaddr + vmsize else None
+        if macho is None:
+            return None
+        segment = next((segment for segment in macho.segments if segment.vmaddr == vmaddr), None)
+        if segment is None or address - vmaddr >= segment.filesize:
+            return None
+        try:
+            with open(self.root / image.path.lstrip("/"), "rb") as fd:
+                fd.seek(segment.fileoff + address - vmaddr)
+                return fd.read(min(size, segment.filesize - (address - vmaddr)))
+        except OSError:
+            return None
+
+    def _read_pointer(self, address: int) -> int:
+        data = self._read(address, POINTER_SIZE)
+        if data is None or len(data) < POINTER_SIZE or self._decode is None:
+            return 0
+        return self._decode(int.from_bytes(data, "little"))
+
+    def _read_objc_name(self, address: int) -> Optional[str]:
+        if address not in self._objc_names:
+            data = self._read(address, MAX_OBJC_NAME_LENGTH) if address else None
+            name = data.split(b"\x00", 1)[0].decode(errors="replace") if data else None
+            self._objc_names[address] = name or None
+        return self._objc_names[address]
+
+    def _objc_selector_base(self) -> Optional[int]:
+        """Get the address the method lists of the cache count their selectors from, which libobjc tells."""
+        if not self._selector_base_read:
+            self._selector_base_read = True
+            libobjc = next((image for image in self.images if image.path == LIBOBJC_PATH), None)
+            macho = self._macho(libobjc) if libobjc is not None else None
+            address, size = macho.objc_sections.get(SELECTOR_OFFSETS_SECTION, (0, 0)) if macho is not None else (0, 0)
+            data = self._read(address, size) if size else None
+            if data is not None and self._decode is not None:
+                # The section holds the bounds of the selectors next to a version, whose place varies
+                for offset in range(0, len(data) - len(data) % POINTER_SIZE, POINTER_SIZE):
+                    raw = int.from_bytes(data[offset : offset + POINTER_SIZE], "little")
+                    if raw > SELECTOR_OFFSETS_MAX_VERSION:
+                        self._selector_base = self._decode(raw)
+                        break
+        return self._selector_base
+
+    def _objc_table(self, image: SymbolImage) -> _ObjCTable:
+        table = self._objc.get(image.path)
+        if table is not None:
+            return table
+        table = _ObjCTable()
+        self._objc[image.path] = table
+        cache_base = self.shared_cache_base
+        macho = self._macho(image)
+        if cache_base is None or macho is None or not image.vmaddr or not macho.objc_sections:
+            return table
+        try:
+            data = (self.root / image.path.lstrip("/")).read_bytes()
+        except OSError as e:
+            logger.debug(f"Could not read the Objective-C metadata of {image.path}: {e}")
+            return table
+        image_data = ImageData(macho, data)
+        if self._decode is None:
+            # Every image of a cache encodes its pointers alike
+            self._decode = find_pointer_decoder(image_data, cache_base)
+        if self._decode is None:
+            return table
+        table.methods = read_objc_methods(image_data, self._decode, self._objc_selector_base())
+        table.addresses = [method.imp for method in table.methods]
+        return table
+
+    def _objc_method_name(self, method: ObjCMethod) -> Optional[str]:
+        class_ro = self._read_pointer(method.class_address + CLASS_DATA) & CLASS_DATA_MASK
+        class_name = self._read_objc_name(self._read_pointer(class_ro + CLASS_RO_NAME)) if class_ro else None
+        selector = self._read_objc_name(method.selector)
+        if class_name is None or selector is None:
+            return None
+        if method.category_name:
+            category = self._read_objc_name(method.category_name)
+            if category is None:
+                return None
+            class_name = f"{class_name}({category})"
+        return f"{'+' if method.is_class_method else '-'}[{class_name} {selector}]"
 
 
 def get_device_support_path(
