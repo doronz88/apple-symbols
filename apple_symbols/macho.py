@@ -52,6 +52,22 @@ class SegmentCommand64(BinaryStruct, byte_order="<"):
 
 
 @dataclass
+class Section64(BinaryStruct, byte_order="<"):
+    sectname: Annotated[str, PaddedString(16, errors="replace")]
+    segname: Annotated[str, PaddedString(16, errors="replace")]
+    addr: u64
+    size: u64
+    offset: u32 = 0
+    align: u32 = 0
+    reloff: u32 = 0
+    nreloc: u32 = 0
+    flags: u32 = 0
+    reserved1: u32 = 0
+    reserved2: u32 = 0
+    reserved3: u32 = 0
+
+
+@dataclass
 class UuidCommand(BinaryStruct, byte_order="<"):
     cmd: u32
     cmdsize: u32
@@ -102,6 +118,17 @@ NLIST_64 = struct.Struct("<IBBHQ")
 MAX_SYMBOL_LENGTH = 4096
 
 
+@dataclass(frozen=True)
+class Segment:
+    """Where a segment is mapped and where the file keeps it."""
+
+    name: str
+    vmaddr: int
+    vmsize: int
+    fileoff: int
+    filesize: int
+
+
 @dataclass
 class MachO:
     """The load commands of a Mach-O which symbolication needs."""
@@ -116,6 +143,9 @@ class MachO:
     stroff: int = 0
     function_starts_offset: int = 0
     function_starts_size: int = 0
+    segments: list[Segment] = field(default_factory=list[Segment])
+    # Address and size of the Objective-C metadata sections, by name
+    objc_sections: dict[str, tuple[int, int]] = field(default_factory=dict[str, tuple[int, int]])
     # Name and file offset of the Mach-O files a fileset (a kernelcache) holds
     fileset_entries: list[tuple[str, int]] = field(default_factory=list[tuple[str, int]])
 
@@ -147,6 +177,15 @@ def _parse_load_commands(commands: ByteReader, ncmds: int) -> Optional[MachO]:
         command = commands.sub(load_command.cmdsize)
         if load_command.cmd == LC_SEGMENT_64:
             segment = SegmentCommand64.read(command)
+            macho.segments.append(
+                Segment(segment.segname, segment.vmaddr, segment.vmsize, segment.fileoff, segment.filesize)
+            )
+            for _ in range(segment.nsects):
+                if command.remaining < Section64.SIZE:
+                    break
+                section = Section64.read(command)
+                if section.sectname.startswith("__objc_"):
+                    macho.objc_sections[section.sectname] = (section.addr, section.size)
             if segment.segname == "__TEXT":
                 macho.vmaddr = segment.vmaddr
                 macho.vmsize = segment.vmsize

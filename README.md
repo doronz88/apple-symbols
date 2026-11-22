@@ -34,6 +34,10 @@ print(symbols.symbolicate(image, image.vmaddr + 0x1234))  # (symbol name, offset
 image = symbols.image_by_address(0x180012345)
 ```
 
+Apple ships some images of the shared cache with no local symbols at all. The functions of such an
+image which implement Objective-C methods are named after its Objective-C metadata instead, e.g.
+`-[APSigningAuthority setupWithCompletion:completion:]`; its other functions stay unnamed.
+
 ```python
 from pathlib import Path
 
