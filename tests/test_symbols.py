@@ -27,6 +27,7 @@ LIBFOO_UUID = "11111111-2222-3333-4444-555555555555"
 LIBFOO_VMADDR = SHARED_CACHE_BASE + 0x10000
 DYLD_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 APP_UUID = "99999999-8888-7777-6666-555555555555"
+DRIVERKIT_UUID = "d0d0d0d0-1111-2222-3333-444444444444"
 
 
 @pytest.fixture
@@ -212,3 +213,22 @@ def test_parse_macho_truncated_is_not_a_macho() -> None:
 def test_nlist_layouts_agree() -> None:
     entry = Nlist64(n_strx=1, n_type=0x0F, n_sect=1, n_desc=0, n_value=0x180000010)
     assert NLIST_64.unpack(entry.build()) == (1, 0x0F, 1, 0, 0x180000010)
+
+
+def test_driverkit_images_do_not_shadow_the_shared_cache(symbols_root: Path, tmp_path: Path) -> None:
+    # The cache of DriverKit is mapped over the very same addresses
+    (symbols_root / "System/DriverKit/usr/lib").mkdir(parents=True)
+    (symbols_root / "System/DriverKit/usr/lib/libdriver.dylib").write_bytes(
+        build_macho(DRIVERKIT_UUID, LIBFOO_VMADDR + 0x800, 0x1000, {}, [])
+    )
+    (symbols_root / "System/DriverKit/usr/lib/libfirst.dylib").write_bytes(
+        build_macho(APP_UUID, SHARED_CACHE_BASE - 0x4000000, 0x1000, {}, [])
+    )
+    symbols = DeviceSupportSymbols.load(symbols_root, tmp_path / "index")
+    image = symbols.image_by_address(LIBFOO_VMADDR + 0x900)
+    assert image is not None
+    assert image.name == "libfoo.dylib"
+    assert symbols.shared_cache_base == SHARED_CACHE_BASE
+    driver = symbols.image_by_uuid(DRIVERKIT_UUID)
+    assert driver is not None
+    assert driver.name == "libdriver.dylib"

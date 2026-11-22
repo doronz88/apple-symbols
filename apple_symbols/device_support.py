@@ -25,6 +25,10 @@ INDEX_DIRNAME = "device_support_index"
 
 DEVICE_SUPPORT_ROOT = Path("~/Library/Developer/Xcode/iOS DeviceSupport")
 
+# The tree also holds the images of the shared cache DriverKit extensions run with, which is mapped
+# over the same addresses, so only one of the caches gets to be looked up by address
+DRIVERKIT_PREFIX = "/System/DriverKit/"
+
 # Shared caches get mapped at a multiple of this, and their first image starts well within it
 SHARED_CACHE_BASE_ALIGNMENT = 0x2000000
 
@@ -94,7 +98,8 @@ class DeviceSupportSymbols:
     def __init__(self, root: Path, images: list[SymbolImage]) -> None:
         self.root = root
         self.images = sorted(images, key=lambda image: image.vmaddr)
-        self._starts = [image.vmaddr for image in self.images]
+        self._addressed = [image for image in self.images if not image.path.startswith(DRIVERKIT_PREFIX)]
+        self._starts = [image.vmaddr for image in self._addressed]
         self._by_uuid = {image.uuid: image for image in self.images}
         self._symtabs: dict[str, _SymbolTable] = {}
         self._names: dict[tuple[str, int], str] = {}
@@ -152,7 +157,7 @@ class DeviceSupportSymbols:
 
         The tree does not keep the header of the cache, so this is derived from its lowest image.
         """
-        lowest = next((image.vmaddr for image in self.images if image.vmaddr), None)
+        lowest = next((image.vmaddr for image in self._addressed if image.vmaddr), None)
         return None if lowest is None else lowest - lowest % SHARED_CACHE_BASE_ALIGNMENT
 
     def image_by_uuid(self, image_uuid: str) -> Optional[SymbolImage]:
@@ -163,7 +168,7 @@ class DeviceSupportSymbols:
         index = bisect.bisect_right(self._starts, address) - 1
         if index < 0:
             return None
-        image = self.images[index]
+        image = self._addressed[index]
         return image if address < image.vmaddr + image.vmsize else None
 
     def _symtab(self, image: SymbolImage) -> _SymbolTable:
