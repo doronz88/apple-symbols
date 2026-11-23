@@ -27,7 +27,8 @@ dependencies = ["bytestruct>=0.2.0"]
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "symbolicator-server"]
+remote = ["symbolicator-server"]
 
 [project.urls]
 "Homepage" = "https://github.com/doronz88/apple-symbols"

@@ -48,6 +48,22 @@ image = kernel.image_by_uuid("12121212-3434-5656-7878-909090909090")
 print(image.name, kernel.symbolicate(image.text_exec + 0x1234))  # addresses are unslid
 ```
 
+### From a symbolicator server
+
+[symbolicator-server](https://github.com/netanelc305/symbolicator-server) holds the symbols of scanned
+IPSWs. `pip install apple-symbols[remote]`; the classes have the same methods as the local ones
+(`UserlandSymbolSource`, `KernelSymbolSource`):
+
+```python
+from symbolicator_server.client import SymbolicatorClient
+
+from apple_symbols.remote import RemoteDeviceSymbols, RemoteKernelSymbols
+
+client = SymbolicatorClient.connect("http://localhost:3993")
+symbols = RemoteDeviceSymbols.for_build(client, "iPhone17,3", "23E246")
+kernel = RemoteKernelSymbols.for_kernelcache(client, "12121212-3434-5656-7878-909090909090")
+```
+
 Indexing a tree or a kernelcache takes a while, so the result is kept in
 `$XDG_CACHE_HOME/apple-symbols` (`~/.cache/apple-symbols` by default) and reused until the files
 change. Both `load()` methods take an `index_dir` to keep it elsewhere.
