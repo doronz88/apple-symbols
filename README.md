@@ -62,6 +62,8 @@ from apple_symbols.remote import RemoteDeviceSymbols, RemoteKernelSymbols
 client = SymbolicatorClient.connect("http://localhost:3993")
 symbols = RemoteDeviceSymbols.for_build(client, "iPhone17,3", "23E246")
 kernel = RemoteKernelSymbols.for_kernelcache(client, "12121212-3434-5656-7878-909090909090")
+# a stackshot does not tell its kernelcache, only its kernel images
+kernel = RemoteKernelSymbols.for_build(client, "iPhone17,3", "23E246", image_uuids)
 ```
 
 Indexing a tree or a kernelcache takes a while, so the result is kept in
