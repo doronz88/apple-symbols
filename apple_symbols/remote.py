@@ -6,6 +6,7 @@ image the first time an address in it is looked up.
 """
 
 import bisect
+from collections.abc import Iterable
 from typing import Optional
 
 from symbolicator_server.client import SymbolicatorClient
@@ -188,6 +189,33 @@ class RemoteKernelSymbols:
             [KernelImage(image.path, image.uuid.lower(), image.text_start | KERNEL_HIGH_BIT) for image in images],
             {image.uuid.lower(): image.text_end | KERNEL_HIGH_BIT for image in images},
         )
+
+    @classmethod
+    def for_build(
+        cls, client: SymbolicatorClient, device: str, build: str, image_uuids: Iterable[str]
+    ) -> "RemoteKernelSymbols":
+        """
+        The kernelcache of a device's build, for a report which does not tell its kernelcache.
+
+        An IPSW holds several kernelcaches, so the one which holds most of the kernel images the
+        report tells is taken.
+
+        :param device: The product type, e.g. ``iPhone17,3``.
+        :param build: The build version, e.g. ``23E246``.
+        :param image_uuids: The UUIDs of the kernel images the report tells.
+        :raises LookupError: If the server has no kernelcache of the build which holds any of them.
+        """
+        wanted = {image_uuid.lower() for image_uuid in image_uuids}
+        best: Optional[RemoteKernelSymbols] = None
+        best_held = 0
+        for kernelcache in client.find_kernelcaches(device, build):
+            symbols = cls.for_kernelcache(client, kernelcache.uuid.lower())
+            held = sum(image.uuid in wanted for image in symbols.images)
+            if held > best_held:
+                best, best_held = symbols, held
+        if best is None:
+            raise LookupError(f"{client.server} has no kernelcache of {device} {build} with the given images")
+        return best
 
     @property
     def has_symbols(self) -> bool:

@@ -2,13 +2,14 @@ from typing import Optional
 
 import pytest
 from symbolicator_server.client import SymbolicatorClient
-from symbolicator_server.models import FunctionSymbol, ImageInfo, SharedCache
+from symbolicator_server.models import FunctionSymbol, ImageInfo, Kernelcache, SharedCache
 
 from apple_symbols.remote import KERNEL_HIGH_BIT, RemoteDeviceSymbols, RemoteKernelSymbols
 
 CACHE_UUID = "8BAF1A04-DCD0-3DDE-97D4-78470487BCCC"
 DRIVERKIT_CACHE_UUID = "AA10039A-2C36-38B1-86FB-6FDB4D4B6790"
 KERNELCACHE_UUID = "31370FC9-3D00-8949-257B-717E28D14DA6"
+RESEARCH_KERNELCACHE_UUID = "42481FDA-4E11-9A5A-368C-828F39E25EB7"
 SHARED_CACHE_BASE = 0x180000000
 LIBFOO_UUID = "11111111-2222-3333-4444-555555555555"
 LIBFOO = ImageInfo(
@@ -19,6 +20,9 @@ DK_LIBFOO = ImageInfo(
 )
 KEXT_UUID = "ABABABAB-CDCD-EFEF-0101-232323232323"
 KEXT = ImageInfo(KEXT_UUID, "com.apple.kec.Libm", 0x7FFFFE0007100000, 0x7FFFFE0007101000)
+RESEARCH_KERNEL = ImageInfo(
+    "EFEFEFEF-0101-2323-4545-676767676767", "com.apple.kernel", 0x7FFFFE0007000000, 0x7FFFFE0007001000
+)
 
 
 class FakeServer:
@@ -33,8 +37,16 @@ class FakeServer:
     def dsc_images(self, uuid: str) -> Optional[list[ImageInfo]]:
         return {CACHE_UUID: [LIBFOO], DRIVERKIT_CACHE_UUID: [DK_LIBFOO]}.get(uuid.upper())
 
+    def find_kernelcaches(self, device: str, build: str) -> list[Kernelcache]:
+        if (device, build) != ("iPhone17,3", "23E246"):
+            return []
+        return [
+            Kernelcache(RESEARCH_KERNELCACHE_UUID, "kernelcache.research.iPhone17,3", None),
+            Kernelcache(KERNELCACHE_UUID, "kernelcache.release.iPhone17,3", None),
+        ]
+
     def kernelcache_images(self, uuid: str) -> Optional[list[ImageInfo]]:
-        return [KEXT] if uuid.upper() == KERNELCACHE_UUID else None
+        return {KERNELCACHE_UUID: [KEXT], RESEARCH_KERNELCACHE_UUID: [RESEARCH_KERNEL]}.get(uuid.upper())
 
     def image_symbols(
         self, uuid: str, dsc: Optional[str] = None, kernelcache: Optional[str] = None
@@ -56,7 +68,7 @@ class FakeServer:
 def server(monkeypatch: pytest.MonkeyPatch) -> tuple[SymbolicatorClient, FakeServer]:
     client = SymbolicatorClient("http://symbolicator.invalid")
     fake = FakeServer()
-    for name in ("find_dscs", "dsc_images", "kernelcache_images", "image_symbols"):
+    for name in ("find_dscs", "dsc_images", "find_kernelcaches", "kernelcache_images", "image_symbols"):
         monkeypatch.setattr(client, name, getattr(fake, name))
     return client, fake
 
@@ -103,3 +115,18 @@ def test_kernel_symbols(server: tuple[SymbolicatorClient, FakeServer]) -> None:
     assert kernel.symbolicate(image.text_exec + 0x2000) is None  # past the kext
     with pytest.raises(LookupError):
         RemoteKernelSymbols.for_kernelcache(client, "00000000-0000-0000-0000-000000000000")
+
+
+def test_kernel_symbols_of_a_build(server: tuple[SymbolicatorClient, FakeServer]) -> None:
+    client, _fake = server
+    # the kernelcache of the build which holds the images of the report, not the first one
+    kernel = RemoteKernelSymbols.for_build(client, "iPhone17,3", "23E246", [KEXT_UUID.lower(), "unknown"])
+    assert kernel.kernelcache_uuid == KERNELCACHE_UUID.lower()
+    image = kernel.image_by_uuid(KEXT_UUID)
+    assert image is not None
+    assert kernel.symbolicate(image.text_exec + 0x14) == ("_kext_func", 4)
+
+    with pytest.raises(LookupError):  # a build the server holds, but none of the images
+        RemoteKernelSymbols.for_build(client, "iPhone17,3", "23E246", ["unknown"])
+    with pytest.raises(LookupError):  # a build the server does not hold
+        RemoteKernelSymbols.for_build(client, "iPhone17,3", "23E247", [KEXT_UUID])
