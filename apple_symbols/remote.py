@@ -2,11 +2,14 @@
 Symbol lookup against a symbolicator server (``pip install apple-symbols[remote]``).
 
 The server holds the symbols of scanned IPSWs. Image lists are fetched up front; the functions of an
-image the first time an address in it is looked up.
+image the first time an address in it is looked up. That is every function of the image, megabytes
+for a system framework, so a report with many frames is named in two passes: within ``collecting()``
+the addresses are only noted, and their functions come in one request on leaving it.
 """
 
 import bisect
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from typing import Optional
 
 from symbolicator_server.client import SymbolicatorClient
@@ -53,6 +56,29 @@ class _FunctionTable:
         return name, address - self.starts[index]
 
 
+def _answers(
+    addresses: list[int],
+    functions: Optional[list[Optional[FunctionSymbol]]],
+    high_bits: int = 0,
+    strip_underscore: bool = False,
+) -> dict[int, Optional[tuple[str, int]]]:
+    """
+    What ``symbolicate()`` answers for each of the addresses, from the function the server found for each.
+
+    :param functions: In the order of `addresses`; `None` when the server does not have the image.
+    """
+    answers: dict[int, Optional[tuple[str, int]]] = {}
+    for address, function in zip(addresses, functions or [None] * len(addresses)):
+        answers[address | high_bits] = None
+        if function is None or function.name is None:
+            continue
+        name = function.name
+        if strip_underscore and name.startswith("_"):
+            name = name[1:]
+        answers[address | high_bits] = (name, (address - function.start) & ~high_bits)
+    return answers
+
+
 class RemoteDeviceSymbols:
     """Resolves addresses to symbols using the shared caches a symbolicator server holds."""
 
@@ -75,6 +101,8 @@ class RemoteDeviceSymbols:
         self._by_uuid = {image.uuid: image for image in self.images}
         self._shared_cache_base = shared_cache_base
         self._tables: dict[SymbolImage, _FunctionTable] = {}
+        self._answers: dict[SymbolImage, dict[int, Optional[tuple[str, int]]]] = {}
+        self._collected: Optional[dict[SymbolImage, set[int]]] = None
 
     @classmethod
     def for_build(cls, client: SymbolicatorClient, device: str, build: str) -> "RemoteDeviceSymbols":
@@ -146,14 +174,48 @@ class RemoteDeviceSymbols:
         :returns: The function name and the offset of `address` from it, or `None` when no named
             function contains it.
         """
+        if self._collected is not None:
+            self._collected.setdefault(image, set()).add(address)
+            return None
         table = self._tables.get(image)
         if table is None:
+            answers = self._answers.get(image, {})
+            if address in answers:
+                return answers[address]
             # Userland names come from symbol tables, which the local backend reads without the underscore.
             # Kernel names come mostly from ipsw signatures, which both backends keep as they are.
             symbols = self.client.image_symbols(image.uuid, dsc=self._cache_of[image])
             table = _FunctionTable.build(symbols, strip_underscore=True)
             self._tables[image] = table
         return table.lookup(address)
+
+    @contextmanager
+    def collecting(self) -> Generator[None, None, None]:
+        """
+        Within it ``symbolicate()`` names nothing and only notes what it is asked. On leaving, the
+        functions of all of it are fetched in one request per shared cache, and ``symbolicate()``
+        answers those addresses from them. So what names many frames is run twice: once within, for
+        the server to be asked once, and once after.
+        """
+        self._collected = {}
+        try:
+            yield
+        except BaseException:
+            self._collected = None
+            raise
+        collected, self._collected = self._collected, None
+        by_cache: dict[str, dict[SymbolImage, list[int]]] = {}
+        for image, addresses in collected.items():
+            if image not in self._tables:
+                by_cache.setdefault(self._cache_of[image], {})[image] = sorted(addresses)
+        for cache_uuid, images in by_cache.items():
+            functions = self.client.find_functions(
+                {image.uuid: addresses for image, addresses in images.items()}, dsc=cache_uuid
+            )
+            for image, addresses in images.items():
+                self._answers.setdefault(image, {}).update(
+                    _answers(addresses, functions.get(image.uuid), strip_underscore=True)
+                )
 
 
 class RemoteKernelSymbols:
@@ -172,6 +234,8 @@ class RemoteKernelSymbols:
         self._text_ends = text_ends
         self._by_uuid = {image.uuid: image for image in self.images}
         self._tables: dict[KernelImage, _FunctionTable] = {}
+        self._answers: dict[KernelImage, dict[int, Optional[tuple[str, int]]]] = {}
+        self._collected: Optional[dict[KernelImage, set[int]]] = None
 
     @classmethod
     def for_kernelcache(cls, client: SymbolicatorClient, kernelcache_uuid: str) -> "RemoteKernelSymbols":
@@ -238,9 +302,44 @@ class RemoteKernelSymbols:
         image = self.images[index]
         if address >= self._text_ends.get(image.uuid, 0):
             return None
+        if self._collected is not None:
+            self._collected.setdefault(image, set()).add(address)
+            return None
         table = self._tables.get(image)
         if table is None:
+            answers = self._answers.get(image, {})
+            if address in answers:
+                return answers[address]
             symbols = self.client.image_symbols(image.uuid, kernelcache=self.kernelcache_uuid)
             table = _FunctionTable.build(symbols, KERNEL_HIGH_BIT)
             self._tables[image] = table
         return table.lookup(address)
+
+    @contextmanager
+    def collecting(self) -> Generator[None, None, None]:
+        """
+        Within it ``symbolicate()`` names nothing and only notes what it is asked. On leaving, the
+        functions of all of it are fetched in one request, and ``symbolicate()`` answers those
+        addresses from them. So what names many frames is run twice: once within, for the server to
+        be asked once, and once after.
+        """
+        self._collected = {}
+        try:
+            yield
+        except BaseException:
+            self._collected = None
+            raise
+        collected, self._collected = self._collected, None
+        # the server stores kernel addresses with bit 63 cleared
+        images = {
+            image: sorted(address & ~KERNEL_HIGH_BIT for address in addresses)
+            for image, addresses in collected.items()
+            if image not in self._tables
+        }
+        if not images:
+            return
+        functions = self.client.find_functions(
+            {image.uuid: addresses for image, addresses in images.items()}, kernelcache=self.kernelcache_uuid
+        )
+        for image, addresses in images.items():
+            self._answers.setdefault(image, {}).update(_answers(addresses, functions.get(image.uuid), KERNEL_HIGH_BIT))
