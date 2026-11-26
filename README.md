@@ -66,6 +66,16 @@ kernel = RemoteKernelSymbols.for_kernelcache(client, "12121212-3434-5656-7878-90
 kernel = RemoteKernelSymbols.for_build(client, "iPhone17,3", "23E246", image_uuids)
 ```
 
+The first lookup in an image fetches every function of it, megabytes for a system framework. To name
+many frames, run what names them twice: within `collecting()` the addresses are only noted, and on
+leaving it their functions are fetched in one request, which the second run is answered from.
+
+```python
+with symbols.collecting(), kernel.collecting():
+    name_frames(report, symbols, kernel)  # names nothing yet
+name_frames(report, symbols, kernel)
+```
+
 Indexing a tree or a kernelcache takes a while, so the result is kept in
 `$XDG_CACHE_HOME/apple-symbols` (`~/.cache/apple-symbols` by default) and reused until the files
 change. Both `load()` methods take an `index_dir` to keep it elsewhere.

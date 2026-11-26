@@ -28,6 +28,7 @@ RESEARCH_KERNEL = ImageInfo(
 class FakeServer:
     def __init__(self) -> None:
         self.symbol_requests: list[tuple[str, Optional[str], Optional[str]]] = []
+        self.function_requests: list[tuple[dict[str, list[int]], Optional[str], Optional[str]]] = []
 
     def find_dscs(self, device: str, build: str) -> list[SharedCache]:
         if (device, build) != ("iPhone17,3", "23E246"):
@@ -63,12 +64,34 @@ class FakeServer:
             return [FunctionSymbol(KEXT.text_start + 0x10, KEXT.text_start + 0x20, "_kext_func")]
         return None
 
+    def find_functions(
+        self, images: dict[str, list[int]], dsc: Optional[str] = None, kernelcache: Optional[str] = None
+    ) -> dict[str, list[Optional[FunctionSymbol]]]:
+        self.function_requests.append((images, dsc, kernelcache))
+        functions: dict[str, list[Optional[FunctionSymbol]]] = {}
+        for uuid, addresses in images.items():
+            symbols = self.image_symbols(uuid, dsc, kernelcache)
+            if symbols is not None:
+                functions[uuid] = [
+                    next((symbol for symbol in symbols if symbol.start <= address < symbol.end), None)
+                    for address in addresses
+                ]
+        self.symbol_requests.clear()
+        return functions
+
 
 @pytest.fixture
 def server(monkeypatch: pytest.MonkeyPatch) -> tuple[SymbolicatorClient, FakeServer]:
     client = SymbolicatorClient("http://symbolicator.invalid")
     fake = FakeServer()
-    for name in ("find_dscs", "dsc_images", "find_kernelcaches", "kernelcache_images", "image_symbols"):
+    for name in (
+        "find_dscs",
+        "dsc_images",
+        "find_kernelcaches",
+        "kernelcache_images",
+        "image_symbols",
+        "find_functions",
+    ):
         monkeypatch.setattr(client, name, getattr(fake, name))
     return client, fake
 
@@ -94,6 +117,49 @@ def test_device_symbols(server: tuple[SymbolicatorClient, FakeServer]) -> None:
     assert fake.symbol_requests == [(LIBFOO_UUID.upper(), CACHE_UUID, None)]
 
 
+def test_device_symbols_collected(server: tuple[SymbolicatorClient, FakeServer]) -> None:
+    client, fake = server
+    symbols = RemoteDeviceSymbols.for_build(client, "iPhone17,3", "23E246")
+    image = symbols.image_by_uuid(LIBFOO_UUID)
+    driverkit_image = symbols.image_by_uuid(DK_LIBFOO.uuid)
+    assert image is not None
+    assert driverkit_image is not None
+    asked = [image.vmaddr + 0x104, image.vmaddr + 0x200, image.vmaddr + 0x310, image.vmaddr + 0x50]
+
+    with symbols.collecting():
+        for address in asked:
+            assert symbols.symbolicate(image, address) is None
+        assert symbols.symbolicate(driverkit_image, driverkit_image.vmaddr + 0x104) is None
+    # one request per shared cache, with the addresses of each of its images
+    assert fake.function_requests == [
+        ({image.uuid: sorted(asked)}, CACHE_UUID, None),
+        ({driverkit_image.uuid: [driverkit_image.vmaddr + 0x104]}, DRIVERKIT_CACHE_UUID, None),
+    ]
+
+    assert symbols.symbolicate(image, image.vmaddr + 0x104) == ("_foo", 4)
+    assert symbols.symbolicate(image, image.vmaddr + 0x200) == ("_bar", 0)
+    assert symbols.symbolicate(image, image.vmaddr + 0x310) is None  # unnamed function
+    assert symbols.symbolicate(image, image.vmaddr + 0x50) is None  # before any function
+    # an image the server does not have
+    assert symbols.symbolicate(driverkit_image, driverkit_image.vmaddr + 0x104) is None
+    assert fake.symbol_requests == []
+    # an address which was not collected is looked up in the functions of the image
+    assert symbols.symbolicate(image, image.vmaddr + 0x108) == ("_foo", 8)
+    assert fake.symbol_requests == [(LIBFOO_UUID.upper(), CACHE_UUID, None)]
+
+
+def test_collecting_which_fails_asks_nothing(server: tuple[SymbolicatorClient, FakeServer]) -> None:
+    client, fake = server
+    symbols = RemoteDeviceSymbols.for_build(client, "iPhone17,3", "23E246")
+    image = symbols.image_by_uuid(LIBFOO_UUID)
+    assert image is not None
+    with pytest.raises(ValueError, match="failed"), symbols.collecting():
+        symbols.symbolicate(image, image.vmaddr + 0x104)
+        raise ValueError("failed")
+    assert fake.function_requests == []
+    assert symbols.symbolicate(image, image.vmaddr + 0x104) == ("_foo", 4)
+
+
 def test_device_symbols_unknown_build(server: tuple[SymbolicatorClient, FakeServer]) -> None:
     client, _ = server
     with pytest.raises(LookupError):
@@ -115,6 +181,30 @@ def test_kernel_symbols(server: tuple[SymbolicatorClient, FakeServer]) -> None:
     assert kernel.symbolicate(image.text_exec + 0x2000) is None  # past the kext
     with pytest.raises(LookupError):
         RemoteKernelSymbols.for_kernelcache(client, "00000000-0000-0000-0000-000000000000")
+
+
+def test_kernel_symbols_collected(server: tuple[SymbolicatorClient, FakeServer]) -> None:
+    client, fake = server
+    kernel = RemoteKernelSymbols.for_kernelcache(client, KERNELCACHE_UUID.lower())
+    image = kernel.image_by_uuid(KEXT_UUID.lower())
+    assert image is not None
+
+    with kernel.collecting():
+        assert kernel.symbolicate(image.text_exec + 0x14) is None
+        assert kernel.symbolicate(image.text_exec + 0x30) is None
+        assert kernel.symbolicate(image.text_exec + 0x2000) is None  # past the kext: of no image
+    # one request, with the addresses as the server stores them
+    assert fake.function_requests == [
+        ({image.uuid: [KEXT.text_start + 0x14, KEXT.text_start + 0x30]}, None, KERNELCACHE_UUID.lower())
+    ]
+
+    assert kernel.symbolicate(image.text_exec + 0x14) == ("_kext_func", 4)
+    assert kernel.symbolicate(image.text_exec + 0x30) is None
+    assert fake.symbol_requests == []
+
+    with kernel.collecting():  # nothing asked, nothing fetched
+        pass
+    assert len(fake.function_requests) == 1
 
 
 def test_kernel_symbols_of_a_build(server: tuple[SymbolicatorClient, FakeServer]) -> None:
